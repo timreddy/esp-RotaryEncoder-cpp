@@ -4,6 +4,7 @@
 
 #include "RotaryEncoder.h"
 #include "driver/gpio.h"
+#include "driver/pulse_cnt.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -11,98 +12,82 @@
 
 #define ESP_INTR_FLAG_DEFAULT 0
 
-void IRAM_ATTR RotaryEncoder::gpio_isr_handler(void* arg)
-{
-    RotaryEncoder* encoder = (RotaryEncoder*)arg;
-    uint8_t encoder_state = encoder->getEncoderState();
-    BaseType_t task_woken = pdFALSE;
-    xQueueSendFromISR(encoder->encoder_queue, &encoder_state, &task_woken);
-    portYIELD_FROM_ISR(task_woken);
-}
+RotaryEncoder::RotaryEncoder(gpio_num_t pinA, gpio_num_t pinB, int min_value, int max_value) :
+    pinA(pinA),
+    pinB(pinB),
+    min_value(min_value),
+    max_value(max_value) {
 
-void RotaryEncoder::vTaskEncoderState(void* pvParam) {
-  RotaryEncoder* encoder = (RotaryEncoder*) pvParam;
+    if(this->max_value <= this->min_value) {
+        ESP_LOGE(tag.c_str(), "Invalid RotaryEncoder range");
+    }
 
-  uint8_t encoder_state;
-  uint8_t new_encoder_state;
-
-  new_encoder_state = encoder_state = encoder->getEncoderState();
-  //should go: 
-  // 1,1 --> 3
-  // 0,1 --> 1
-  // 0,0 --> 0
-  // 1,0 --> 2
-  // 3->1->0->2->3 CW 
-  //    3->1 CW   1101  13
-  //    1->0 CW   0100  4
-  //    0->2 CW   0010  2
-  //    2->3 CW   1011  11
-  // 
-  // 3->2->0->1->3 CCW
-  //    3->2      14
-  //    2->0      8
-  //    0->1      1
-  //    1->3      7
-  
-  //          0   1   2   3   4   5   6   7   8   9   10    11    12    13    14    15
-  int delta[16] = {0, -1,  1,  0,  1,  0,  0,  -1, -1, 0,  0,    1,    0,    1,    -1,   0};
-
-  while(1) {
-     xQueueReceive(encoder->encoder_queue, &new_encoder_state, 10);
-     encoder->count += delta[encoder_state << 2 | new_encoder_state];
-     ESP_LOGV(encoder->tag.c_str(), "New state: (%d, %d)   New count: %d", new_encoder_state >> 1, new_encoder_state & 1, encoder->count);
-     encoder_state = new_encoder_state;
-  }
-}
-
-RotaryEncoder::RotaryEncoder() { 
-    this->pinA = GPIO_NUM_26;
-    this->pinB = GPIO_NUM_25;
-
-    this->init();
-}
-
-RotaryEncoder::RotaryEncoder(gpio_num_t pinA, gpio_num_t pinB) {
     this->pinA = pinA;
     this->pinB = pinB;
 
     this->init();
 }
 
-uint8_t RotaryEncoder::getEncoderState(void) {
-    return (gpio_get_level(this->pinA) << 1) | gpio_get_level(this->pinB);
-}
-
 void RotaryEncoder::init(void) {
-    this->count = 0;
-    this->tag = "RotaryEncoder(";
-    this->tag += to_string(this->pinA);
-    this->tag += ",";
-    this->tag += to_string(this->pinB);
-    this->tag += ")";
+    this->tag = "RotaryEncoder";
 
-    gpio_config_t config;
-    config.pin_bit_mask = ( (uint64_t) 1 << this->pinA) | ( (uint64_t) 1 << this->pinB);
-    config.mode = GPIO_MODE_INPUT;
-    config.pull_up_en = GPIO_PULLUP_ENABLE;
-    config.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    config.intr_type = GPIO_INTR_ANYEDGE;
+    pcnt_unit_config_t pcnt_config;
+    // We will use the full allowable range, and handle internally controlling the range
+    pcnt_config.low_limit = INT16_MIN;
+    pcnt_config.high_limit = INT16_MAX;
+    pcnt_config.flags.accum_count = 0;
+    pcnt_config.intr_priority = 0;
 
-    this->encoder_queue = xQueueCreate( 10, sizeof( uint8_t ) );
+    ESP_ERROR_CHECK(pcnt_new_unit(&pcnt_config, &(this->pulse_counter)));
 
-    gpio_reset_pin(this->pinA);
-    gpio_reset_pin(this->pinB);
-    gpio_config(&config);
+    pcnt_glitch_filter_config_t glitch_config;
+    glitch_config.max_glitch_ns = 1000;
+    ESP_ERROR_CHECK(pcnt_unit_set_glitch_filter(this->pulse_counter, &glitch_config));
 
-    gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
-    gpio_isr_handler_add(this->pinA, RotaryEncoder::gpio_isr_handler, (void*) this);
-    gpio_isr_handler_add(this->pinB, RotaryEncoder::gpio_isr_handler, (void*) this);
+    pcnt_chan_config_t pcnt_chan_a_config;
+    pcnt_chan_a_config.edge_gpio_num              = this->pinA;
+    pcnt_chan_a_config.level_gpio_num             = this->pinB;
+    pcnt_chan_a_config.flags.invert_edge_input    = 0;
+    pcnt_chan_a_config.flags.invert_level_input   = 0;
+    pcnt_chan_a_config.flags.io_loop_back         = 0;
+    pcnt_chan_a_config.flags.virt_edge_io_level   = 0;
+    pcnt_chan_a_config.flags.virt_level_io_level  = 0;
 
-    TaskHandle_t xHandle = NULL;
-    xTaskCreate(RotaryEncoder::vTaskEncoderState, "Encoder", 5000, this, tskIDLE_PRIORITY, &xHandle );
-    configASSERT( xHandle );
+    ESP_ERROR_CHECK(pcnt_new_channel(this->pulse_counter, &pcnt_chan_a_config, &(this->pulse_counter_channel_a)));
+
+    pcnt_chan_config_t pcnt_chan_b_config;
+    pcnt_chan_b_config.edge_gpio_num              = this->pinB;
+    pcnt_chan_b_config.level_gpio_num             = this->pinA;
+    pcnt_chan_b_config.flags.invert_edge_input    = 0;
+    pcnt_chan_b_config.flags.invert_level_input   = 0;
+    pcnt_chan_b_config.flags.io_loop_back         = 0;
+    pcnt_chan_b_config.flags.virt_edge_io_level   = 0;
+    pcnt_chan_b_config.flags.virt_level_io_level  = 0;
+
+    ESP_ERROR_CHECK(pcnt_new_channel(this->pulse_counter, &pcnt_chan_b_config, &(this->pulse_counter_channel_b)));
+
+    pcnt_channel_set_edge_action(this->pulse_counter_channel_a, PCNT_CHANNEL_EDGE_ACTION_DECREASE, PCNT_CHANNEL_EDGE_ACTION_INCREASE);
+    pcnt_channel_set_level_action(this->pulse_counter_channel_a, PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE);
+    pcnt_channel_set_edge_action(this->pulse_counter_channel_b, PCNT_CHANNEL_EDGE_ACTION_INCREASE, PCNT_CHANNEL_EDGE_ACTION_DECREASE);
+    pcnt_channel_set_level_action(this->pulse_counter_channel_b, PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE);
+
+    ESP_ERROR_CHECK(pcnt_unit_enable(this->pulse_counter));
+
+    ESP_ERROR_CHECK(pcnt_unit_clear_count(this->pulse_counter));
+    this->current_count = 0;
+
+    ESP_ERROR_CHECK(pcnt_unit_start(this->pulse_counter));
 }
 
 int RotaryEncoder::getCount(void) {
-    return this->count;
+    int new_count;
+    ESP_ERROR_CHECK(pcnt_unit_get_count(this->pulse_counter, &new_count));
+    ESP_ERROR_CHECK(pcnt_unit_clear_count(this->pulse_counter));
+
+    this->current_count += new_count;
+
+    // If we get to the limit, stay there.
+    if(this->current_count > this->max_value) { this->current_count = this->max_value; }
+    else if(this->current_count < this->min_value) { this->current_count = this->min_value; }
+    return this->current_count;
 }
